@@ -419,6 +419,9 @@ namespace MeshLib
     bool ray_intersect_triangle(const CPoint &orig, const CPoint &dir, const Tri &tri) const;
     bool point_in_mesh_fast(const CPoint &p) const;
     bool point_in_mesh_vote(const CPoint &p) const;
+    void refine_point_state();
+    bool point_state(int gx, int gy, int gz) const;
+    unsigned char cell_config(int x, int y, int z) const;
     int get_index_on(int x, int y, int z, int bitIndex) const;
     void init_child_range(OctreeNode *node, OctreeNode *parent, int index) const;
     OctreeNode *create_to_leaf(int x, int y, int z);
@@ -438,6 +441,11 @@ namespace MeshLib
                             map<EdgeKey, int> &edgeUse,
                             map<EdgeKey, int> &dirEdgeUse,
                             double quant) const;
+    void generate_cell_mc(int x, int y, int z, unsigned char cfg, M *out, int &vid, int &fid,
+                map<VertKey, typename M::CVertex *> &vmap,
+                map<EdgeKey, int> &edgeUse,
+                map<EdgeKey, int> &dirEdgeUse,
+                double quant) const;
     CPoint get_intersected_point_at_edge(const BoxRange &range, int edgeIndex, const OSMCInt3 &normal, int d) const;
     bool can_add_face(vector<typename M::CVertex *> &verts,
                       map<EdgeKey, int> &edgeUse,
@@ -458,6 +466,8 @@ namespace MeshLib
     OctreeNode *m_root;
     vector<Tri> m_tris;
     queue<OctreeNode *> m_queue;
+    vector<signed char> m_pointState;
+    int m_pointGridSize;
   };
 
   static const int kPointDeltaCS[8][3] = {
@@ -472,6 +482,20 @@ namespace MeshLib
 
   static const unsigned char kPointFlagCS[8] = {
       1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5, 1 << 6, 1 << 7};
+
+  // Map C# corner index order to standard MC corner order used by kTriTable.
+  static const int kCsToMcCorner[8] = {7, 3, 0, 4, 6, 2, 1, 5};
+
+  static inline unsigned char remap_cfg_to_mc(unsigned char cfg)
+  {
+    unsigned char out = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+      if (cfg & (1 << i))
+        out |= static_cast<unsigned char>(1 << kCsToMcCorner[i]);
+    }
+    return out;
+  }
 
   static const int kVertexVoxelIndexCS[8] = {2, 6, 1, 5, 3, 7, 0, 4};
   static const int kMidVoxelIndexCS[8] = {4, 0, 7, 3, 5, 1, 6, 2};
@@ -845,16 +869,16 @@ namespace MeshLib
     if (cellLogStep < 1000)
       cellLogStep = 1000;
 
-    int gp = m_scale + 1;
-    vector<signed char> pointState(static_cast<size_t>(gp) * gp * gp, -1);
+    m_pointGridSize = m_scale + 1;
+    m_pointState.assign(static_cast<size_t>(m_pointGridSize) * m_pointGridSize * m_pointGridSize, -1);
     auto pointIndex = [&](int gx, int gy, int gz) -> size_t
     {
-      return (static_cast<size_t>(gz) * gp + gy) * gp + gx;
+      return (static_cast<size_t>(gz) * m_pointGridSize + gy) * m_pointGridSize + gx;
     };
     auto pointInsideCached = [&](int gx, int gy, int gz) -> bool
     {
       size_t idx = pointIndex(gx, gy, gz);
-      signed char &st = pointState[idx];
+      signed char &st = m_pointState[idx];
       if (st < 0)
       {
         CPoint p = grid_to_world(static_cast<double>(gx), static_cast<double>(gy), static_cast<double>(gz));
@@ -911,6 +935,126 @@ namespace MeshLib
       }
     }
     cout << "[OctreeSMC] ConstructTree done, boundary cells=" << boundaryCells << endl;
+
+    refine_point_state();
+  }
+
+  template <typename M>
+  bool COctreeSMC<M>::point_state(int gx, int gy, int gz) const
+  {
+    size_t idx = (static_cast<size_t>(gz) * m_pointGridSize + gy) * m_pointGridSize + gx;
+    return m_pointState[idx] > 0;
+  }
+
+  template <typename M>
+  unsigned char COctreeSMC<M>::cell_config(int x, int y, int z) const
+  {
+    unsigned char cfg = 0;
+    for (int pi = 0; pi < 8; ++pi)
+    {
+      int gx = x + kPointDeltaCS[pi][0];
+      int gy = y + kPointDeltaCS[pi][1];
+      int gz = z + kPointDeltaCS[pi][2];
+      if (point_state(gx, gy, gz))
+        cfg |= kPointFlagCS[pi];
+    }
+    return cfg;
+  }
+
+  template <typename M>
+  void COctreeSMC<M>::refine_point_state()
+  {
+    long long refined = 0;
+    for (int z = 0; z < m_scale; ++z)
+    {
+      for (int y = 0; y < m_scale; ++y)
+      {
+        for (int x = 0; x < m_scale; ++x)
+        {
+          unsigned char cfg = cell_config(x, y, z);
+          if (cfg == 0 || cfg == 255)
+            continue;
+          for (int pi = 0; pi < 8; ++pi)
+          {
+            int gx = x + kPointDeltaCS[pi][0];
+            int gy = y + kPointDeltaCS[pi][1];
+            int gz = z + kPointDeltaCS[pi][2];
+            size_t idx = (static_cast<size_t>(gz) * m_pointGridSize + gy) * m_pointGridSize + gx;
+            CPoint p = grid_to_world(static_cast<double>(gx), static_cast<double>(gy), static_cast<double>(gz));
+            m_pointState[idx] = point_in_mesh_vote(p) ? 1 : 0;
+          }
+          refined++;
+        }
+      }
+    }
+    cout << "[OctreeSMC] Refine points for connectivity, cells=" << refined << endl;
+
+    // Majority smoothing on boundary vertices to reduce cracks.
+    int gp = m_pointGridSize;
+    vector<unsigned char> boundary(static_cast<size_t>(gp) * gp * gp, 0);
+    for (int z = 0; z < m_scale; ++z)
+    {
+      for (int y = 0; y < m_scale; ++y)
+      {
+        for (int x = 0; x < m_scale; ++x)
+        {
+          unsigned char cfg = cell_config(x, y, z);
+          if (cfg == 0 || cfg == 255)
+            continue;
+          for (int pi = 0; pi < 8; ++pi)
+          {
+            int gx = x + kPointDeltaCS[pi][0];
+            int gy = y + kPointDeltaCS[pi][1];
+            int gz = z + kPointDeltaCS[pi][2];
+            size_t idx = (static_cast<size_t>(gz) * gp + gy) * gp + gx;
+            boundary[idx] = 1;
+          }
+        }
+      }
+    }
+
+    vector<signed char> nextState = m_pointState;
+    long long smoothed = 0;
+    for (int z = 1; z < gp - 1; ++z)
+    {
+      for (int y = 1; y < gp - 1; ++y)
+      {
+        for (int x = 1; x < gp - 1; ++x)
+        {
+          size_t idx = (static_cast<size_t>(z) * gp + y) * gp + x;
+          if (!boundary[idx])
+            continue;
+          int count = 0;
+          int total = 0;
+          for (int dz = -1; dz <= 1; ++dz)
+          {
+            for (int dy = -1; dy <= 1; ++dy)
+            {
+              for (int dx = -1; dx <= 1; ++dx)
+              {
+                if (dx == 0 && dy == 0 && dz == 0)
+                  continue;
+                size_t nidx = (static_cast<size_t>(z + dz) * gp + (y + dy)) * gp + (x + dx);
+                if (m_pointState[nidx] > 0)
+                  count++;
+                total++;
+              }
+            }
+          }
+          if (total > 0)
+          {
+            int next = (count * 2 >= total) ? 1 : 0;
+            if (nextState[idx] != next)
+            {
+              nextState[idx] = static_cast<signed char>(next);
+              smoothed++;
+            }
+          }
+        }
+      }
+    }
+    m_pointState.swap(nextState);
+    cout << "[OctreeSMC] Smooth boundary vertices, changed=" << smoothed << endl;
   }
 
   template <typename M>
@@ -1099,7 +1243,7 @@ namespace MeshLib
                                     map<EdgeKey, int> &dirEdgeUse,
                                     double quant) const
   {
-    unsigned char cfg = node->parms.config;
+    unsigned char cfg = remap_cfg_to_mc(node->parms.config);
     int nt = kConfigToNormalTypeId[cfg];
     if (nt >= static_cast<int>(kNormalNotSimple))
     {
@@ -1174,7 +1318,7 @@ namespace MeshLib
                                          map<EdgeKey, int> &dirEdgeUse,
                                          double quant) const
   {
-    unsigned char cfg = node->parms.config;
+    unsigned char cfg = remap_cfg_to_mc(node->parms.config);
     if (cfg == 0 || cfg == 255)
       return;
 
@@ -1193,7 +1337,11 @@ namespace MeshLib
       int b = kEdgeCorners[e][1];
       edgePts[e] = (corners[a] + corners[b]) * 0.5;
     }
-    CPoint cellCenter = grid_to_world(node->range.xmin + 0.5, node->range.ymin + 0.5, node->range.zmin + 0.5);
+    int cx = node->range.xmin;
+    int cy = node->range.ymin;
+    int cz = node->range.zmin;
+    CPoint cellCenter = grid_to_world(cx + 0.5, cy + 0.5, cz + 0.5);
+    bool centerInside = point_in_mesh_vote(cellCenter);
 
     for (int i = 0; kTriTable[cfg][i] != -1; i += 3)
     {
@@ -1204,7 +1352,62 @@ namespace MeshLib
       if (n.norm() <= 1e-10)
         continue;
       CPoint triCenter = (p0 + p1 + p2) / 3.0;
-      if ((n * (triCenter - cellCenter)) < 0)
+      if ((centerInside && (n * (triCenter - cellCenter)) < 0) ||
+          (!centerInside && (n * (triCenter - cellCenter)) > 0))
+      {
+        CPoint t = p1;
+        p1 = p2;
+        p2 = t;
+      }
+      vector<typename M::CVertex *> tri;
+      tri.push_back(get_vertex(p0, out, vid, vmap, quant));
+      tri.push_back(get_vertex(p1, out, vid, vmap, quant));
+      tri.push_back(get_vertex(p2, out, vid, vmap, quant));
+      if (can_add_face(tri, edgeUse, dirEdgeUse))
+        out->createFace(tri, fid++);
+    }
+  }
+
+  template <typename M>
+  void COctreeSMC<M>::generate_cell_mc(int x, int y, int z, unsigned char cfg, M *out, int &vid, int &fid,
+                                       map<VertKey, typename M::CVertex *> &vmap,
+                                       map<EdgeKey, int> &edgeUse,
+                                       map<EdgeKey, int> &dirEdgeUse,
+                                       double quant) const
+  {
+    unsigned char mcCfg = remap_cfg_to_mc(cfg);
+    if (mcCfg == 0 || mcCfg == 255)
+      return;
+
+    CPoint corners[8];
+    for (int k = 0; k < 8; ++k)
+    {
+      double gx = x + kCornerOffset[k][0];
+      double gy = y + kCornerOffset[k][1];
+      double gz = z + kCornerOffset[k][2];
+      corners[k] = grid_to_world(gx, gy, gz);
+    }
+    CPoint edgePts[12];
+    for (int e = 0; e < 12; ++e)
+    {
+      int a = kEdgeCorners[e][0];
+      int b = kEdgeCorners[e][1];
+      edgePts[e] = (corners[a] + corners[b]) * 0.5;
+    }
+    CPoint cellCenter = grid_to_world(x + 0.5, y + 0.5, z + 0.5);
+    bool centerInside = point_in_mesh_vote(cellCenter);
+
+    for (int i = 0; kTriTable[mcCfg][i] != -1; i += 3)
+    {
+      CPoint p0 = edgePts[kTriTable[mcCfg][i]];
+      CPoint p1 = edgePts[kTriTable[mcCfg][i + 1]];
+      CPoint p2 = edgePts[kTriTable[mcCfg][i + 2]];
+      CPoint n = (p1 - p0) ^ (p2 - p0);
+      if (n.norm() <= 1e-10)
+        continue;
+      CPoint triCenter = (p0 + p1 + p2) / 3.0;
+      if ((centerInside && (n * (triCenter - cellCenter)) < 0) ||
+          (!centerInside && (n * (triCenter - cellCenter)) > 0))
       {
         CPoint t = p1;
         p1 = p2;
@@ -1267,12 +1470,25 @@ namespace MeshLib
       if (node->is_leaf())
       {
         visitedLeaves++;
-        if (!node->parms.valid)
-          continue;
-        if (node->range.is_single())
-          generate_face_leaf(node, out, vid, fid, vmap, edgeUse, dirEdgeUse, quant);
-        else
-          generate_face(node, out, vid, fid, vmap, edgeUse, dirEdgeUse, quant);
+        int zmin = node->range.zmin;
+        int zmax = node->range.zmax;
+        int ymin = node->range.ymin;
+        int ymax = node->range.ymax;
+        int xmin = node->range.xmin;
+        int xmax = node->range.xmax;
+        for (int z = zmin; z <= zmax; ++z)
+        {
+          for (int y = ymin; y <= ymax; ++y)
+          {
+            for (int x = xmin; x <= xmax; ++x)
+            {
+              unsigned char cfg = cell_config(x, y, z);
+              if (cfg == 0 || cfg == 255)
+                continue;
+              generate_cell_mc(x, y, z, cfg, out, vid, fid, vmap, edgeUse, dirEdgeUse, quant);
+            }
+          }
+        }
       }
       else
       {

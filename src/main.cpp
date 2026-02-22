@@ -9,10 +9,9 @@ using namespace MeshLib;
 void main(int argc, char **argv)
 {
 	CTMesh mesh;
-	mesh.read_obj("pcb.obj");
-	mesh.write_m("pcb.m");
+	mesh.read_m("eight.m");
 	COctreeSMC<CTMesh> smc(&mesh);
 	CTMesh *quad = smc.quad_mesh();
-	quad->write_m("pcb_quad.m");
+	quad->write_m("eight_quad.m");
 	cout << "Finished!" << endl;
 }
