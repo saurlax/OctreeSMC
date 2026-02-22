@@ -6,12 +6,31 @@
 #include <set>
 #include <cmath>
 #include <algorithm>
+#include <queue>
+#include <climits>
+#include <iostream>
+#include <chrono>
 
 #include "ToolMesh.h"
 
 namespace MeshLib
 {
   using namespace std;
+
+  struct OSMCInt3
+  {
+    int x;
+    int y;
+    int z;
+  };
+
+  struct OSMCEq4
+  {
+    int a;
+    int b;
+    int c;
+    int d;
+  };
 
   static const int kCornerOffset[8][3] = {
       {0, 0, 0},
@@ -289,39 +308,81 @@ namespace MeshLib
   {
   public:
     COctreeSMC(M *pMesh, int maxDepth = 6);
-    ~COctreeSMC() {};
-
+    ~COctreeSMC();
     M *quad_mesh();
 
   private:
+    struct Tri
+    {
+      CPoint p0;
+      CPoint p1;
+      CPoint p2;
+      CPoint bmin;
+      CPoint bmax;
+    };
+
+    struct BoxRange
+    {
+      int xmin;
+      int ymin;
+      int zmin;
+      int xmax;
+      int ymax;
+      int zmax;
+      bool is_single() const
+      {
+        return xmin == xmax && ymin == ymax && zmin == zmax;
+      }
+    };
+
+    struct NodeParms
+    {
+      unsigned char config;
+      int d;
+      bool valid;
+      NodeParms() : config(0), d(0), valid(false) {}
+    };
+
     struct OctreeNode
     {
-      CPoint min;
-      CPoint max;
-      int depth;
       OctreeNode *children[8];
-      vector<typename M::CFace *> faces;
-      vector<int> tris;
-      bool boundary;
-      bool inside;
+      OctreeNode *parent;
+      BoxRange range;
+      int indexInParent;
+      int layerIndex;
+      bool visited;
+      NodeParms parms;
 
-      OctreeNode(const CPoint &pmin, const CPoint &pmax, int d)
-          : min(pmin), max(pmax), depth(d), boundary(false), inside(false)
+      OctreeNode()
+      {
+        parent = NULL;
+        indexInParent = -1;
+        layerIndex = 0;
+        visited = false;
+        for (int i = 0; i < 8; ++i)
+          children[i] = NULL;
+      }
+      ~OctreeNode()
+      {
+        clear_children();
+      }
+      bool is_leaf() const
       {
         for (int i = 0; i < 8; ++i)
-        {
-          children[i] = NULL;
-        }
+          if (children[i] != NULL)
+            return false;
+        return true;
       }
-
-      bool is_leaf() const
+      void clear_children()
       {
         for (int i = 0; i < 8; ++i)
         {
           if (children[i] != NULL)
-            return false;
+          {
+            delete children[i];
+            children[i] = NULL;
+          }
         }
-        return true;
       }
     };
 
@@ -337,41 +398,11 @@ namespace MeshLib
       }
     };
 
-    struct FacePair
-    {
-      typename M::CFace *f1;
-      typename M::CFace *f2;
-    };
-
-    struct Tri
-    {
-      CPoint p0;
-      CPoint p1;
-      CPoint p2;
-      CPoint bmin;
-      CPoint bmax;
-    };
-
-    struct CellKey
-    {
-      int x;
-      int y;
-      int z;
-      bool operator<(const CellKey &rhs) const
-      {
-        if (x != rhs.x)
-          return x < rhs.x;
-        if (y != rhs.y)
-          return y < rhs.y;
-        return z < rhs.z;
-      }
-    };
-
     struct VertKey
     {
-      int x;
-      int y;
-      int z;
+      long long x;
+      long long y;
+      long long z;
       bool operator<(const VertKey &rhs) const
       {
         if (x != rhs.x)
@@ -383,47 +414,122 @@ namespace MeshLib
     };
 
   private:
-    OctreeNode *build_root();
-    void build_triangles(vector<Tri> &tris) const;
-    void build_octree(OctreeNode *node, const vector<int> &tri_ids, int maxDepth, int maxTris);
-    bool tri_box_overlap(const Tri &tri, const CPoint &bmin, const CPoint &bmax) const;
-    void classify_leaves(OctreeNode *node, const vector<Tri> &tris);
-    bool point_in_mesh(const CPoint &p, const vector<Tri> &tris) const;
+    void build_root_bbox();
+    void build_triangles();
     bool ray_intersect_triangle(const CPoint &orig, const CPoint &dir, const Tri &tri) const;
-    bool point_in_mesh_vote(const CPoint &p, const vector<Tri> &tris) const;
-    OctreeNode *find_leaf(OctreeNode *node, const CPoint &p) const;
-    void insert_face(OctreeNode *node, typename M::CFace *face, const CPoint &centroid);
-    void collect_leaves(OctreeNode *node, vector<OctreeNode *> &leaves);
-    CPoint face_centroid(typename M::CFace *face) const;
-    void face_vertices(typename M::CFace *face, vector<typename M::CVertex *> &verts) const;
-    bool are_coplanar(const vector<typename M::CVertex *> &a, const vector<typename M::CVertex *> &b) const;
-    bool build_quad(const vector<typename M::CVertex *> &a, const vector<typename M::CVertex *> &b,
-                    vector<typename M::CVertex *> &quad) const;
-    bool valid_triangle(const vector<typename M::CVertex *> &verts) const;
-    bool valid_quad(const vector<typename M::CVertex *> &verts, const CPoint &normal) const;
-    typename M::CVertex *get_or_create_vertex(M *out, typename M::CVertex *v, map<typename M::CVertex *, typename M::CVertex *> &vmap, int &vid) const;
+    bool point_in_mesh_fast(const CPoint &p) const;
+    bool point_in_mesh_vote(const CPoint &p) const;
+    int get_index_on(int x, int y, int z, int bitIndex) const;
+    void init_child_range(OctreeNode *node, OctreeNode *parent, int index) const;
+    OctreeNode *create_to_leaf(int x, int y, int z);
+    void construct_tree();
+    void shrink_tree();
+    bool can_merge_node(OctreeNode *node, int &D) const;
+    unsigned char calculate_config(OctreeNode *children[8]) const;
+    int calculate_d(int cx, int cy, int cz, unsigned char config) const;
+    CPoint grid_to_world(double gx, double gy, double gz) const;
+    void generate_face(OctreeNode *node, M *out, int &vid, int &fid,
+                       map<VertKey, typename M::CVertex *> &vmap,
+                       map<EdgeKey, int> &edgeUse,
+                       map<EdgeKey, int> &dirEdgeUse,
+                       double quant) const;
+    void generate_face_leaf(OctreeNode *node, M *out, int &vid, int &fid,
+                            map<VertKey, typename M::CVertex *> &vmap,
+                            map<EdgeKey, int> &edgeUse,
+                            map<EdgeKey, int> &dirEdgeUse,
+                            double quant) const;
+    CPoint get_intersected_point_at_edge(const BoxRange &range, int edgeIndex, const OSMCInt3 &normal, int d) const;
+    bool can_add_face(vector<typename M::CVertex *> &verts,
+                      map<EdgeKey, int> &edgeUse,
+                      map<EdgeKey, int> &dirEdgeUse) const;
+    typename M::CVertex *get_vertex(const CPoint &p,
+                                    M *out,
+                                    int &vid,
+                                    map<VertKey, typename M::CVertex *> &vmap,
+                                    double quant) const;
 
   private:
     M *m_pMesh;
     int m_maxDepth;
+    int m_scale;
+    CPoint m_rootMin;
+    CPoint m_rootMax;
+    double m_step;
     OctreeNode *m_root;
     vector<Tri> m_tris;
+    queue<OctreeNode *> m_queue;
   };
+
+  static const int kPointDeltaCS[8][3] = {
+      {0, 1, 1},
+      {0, 1, 0},
+      {0, 0, 0},
+      {0, 0, 1},
+      {1, 1, 1},
+      {1, 1, 0},
+      {1, 0, 0},
+      {1, 0, 1}};
+
+  static const unsigned char kPointFlagCS[8] = {
+      1 << 0, 1 << 1, 1 << 2, 1 << 3, 1 << 4, 1 << 5, 1 << 6, 1 << 7};
+
+  static const int kVertexVoxelIndexCS[8] = {2, 6, 1, 5, 3, 7, 0, 4};
+  static const int kMidVoxelIndexCS[8] = {4, 0, 7, 3, 5, 1, 6, 2};
+  static const unsigned char kNormalNotSimple = 13;
+
+  static const unsigned char kConfigToNormalTypeId[256] = {
+      13, 0, 1, 2, 3, 13, 4, 13, 5, 6, 13, 13, 7, 13, 13, 8, 3, 9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 0, 13, 13, 13, 13,
+      5, 13, 10, 13, 13, 13, 13, 1, 13, 13, 13, 13, 13, 13, 13, 13, 7, 13, 13, 11, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 2,
+      0, 13, 13, 13, 9, 13, 13, 13, 13, 13, 13, 13, 13, 13, 3, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13,
+      13, 6, 13, 13, 13, 13, 13, 12, 13, 13, 13, 13, 13, 13, 13, 13, 4, 13, 13, 5, 13, 13, 13, 13, 10, 13, 13, 13, 13, 13, 13, 13,
+      1, 1, 13, 13, 13, 13, 13, 13, 13, 10, 13, 13, 13, 13, 5, 13, 13, 4, 13, 13, 13, 13, 13, 13, 13, 13, 12, 13, 13, 13, 13, 13,
+      6, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 3, 13, 13, 13, 13, 13, 13, 13, 13, 9, 13, 13, 13, 0,
+      2, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 13, 11, 13, 13, 7, 13, 13, 13, 13, 13, 13, 13, 13, 1, 13, 13, 13, 13, 10, 13, 5,
+      13, 13, 13, 13, 0, 13, 13, 13, 13, 13, 13, 13, 13, 13, 9, 3, 8, 13, 13, 7, 13, 13, 6, 5, 13, 4, 13, 3, 2, 1, 0, 13};
+
+  static const unsigned char kConfigToEqType[256] = {
+      55, 0, 1, 2, 3, 55, 4, 55, 5, 6, 55, 55, 7, 55, 55, 8, 9, 10, 55, 55, 55, 55, 55, 55, 55, 55, 55, 11, 55, 55, 55, 55,
+      12, 55, 13, 55, 55, 55, 55, 14, 55, 55, 55, 55, 55, 55, 55, 55, 15, 55, 55, 16, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 17,
+      18, 55, 55, 55, 19, 55, 55, 55, 55, 55, 55, 55, 55, 20, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55,
+      0, 21, 55, 55, 55, 55, 55, 22, 55, 55, 55, 55, 55, 55, 55, 55, 23, 55, 55, 24, 55, 55, 55, 55, 25, 55, 55, 55, 0, 55, 0, 0,
+      26, 27, 55, 55, 55, 55, 55, 55, 55, 55, 28, 55, 55, 55, 55, 29, 55, 55, 30, 55, 55, 55, 55, 55, 55, 55, 55, 31, 55, 55, 55, 55,
+      55, 32, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 55, 0, 55, 33, 55, 55, 55, 55, 55, 0, 55, 55, 55, 34, 55, 0,
+      0, 35, 36, 55, 55, 55, 55, 55, 55, 55, 55, 55, 37, 55, 55, 38, 55, 55, 55, 55, 55, 55, 55, 0, 39, 55, 55, 0, 55, 40, 0, 41,
+      55, 55, 55, 55, 42, 55, 55, 0, 55, 55, 55, 0, 55, 0, 43, 44, 45, 55, 55, 46, 55, 0, 47, 48, 55, 49, 0, 50, 51, 52, 53, 55};
+
+  static const OSMCInt3 kNormalTypeIdToNormal[13] = {
+      {1, -1, -1}, {1, -1, 1}, {1, -1, 0}, {1, 1, 1}, {1, 0, 1}, {1, 1, -1}, {1, 0, -1}, {1, 1, 0}, {1, 0, 0}, {0, 1, 1}, {0, 1, -1}, {0, 1, 0}, {0, 0, 1}};
+
+  static const OSMCEq4 kEqTypeToEqQuad[54] = {
+      {1, -1, -1, -1}, {1, -1, 1, 0}, {1, -1, 0, 0}, {1, 1, 1, 1}, {1, 0, 1, 1}, {1, 1, -1, 0}, {1, 0, -1, 0}, {1, 1, 0, 1}, {1, 0, 0, 1},
+      {1, 1, 1, 2}, {0, 1, 1, 1}, {1, -1, -1, 0}, {1, 1, -1, 1}, {0, 1, -1, 0}, {1, -1, 1, 1}, {1, 1, 0, 1}, {0, 1, 0, 0}, {1, -1, 0, 1},
+      {1, -1, -1, 0}, {0, 1, 1, 1}, {1, 1, 1, 2}, {1, 0, -1, 0}, {0, 0, 1, 1}, {1, 0, 1, 2}, {1, 1, -1, 0}, {0, 1, -1, -1}, {1, -1, 1, 2},
+      {1, -1, 1, 1}, {0, 1, -1, 0}, {1, 1, -1, 1}, {1, 0, 1, 1}, {0, 0, 1, 0}, {1, 0, -1, 1}, {1, 1, 1, 1}, {0, 1, 1, 0}, {1, -1, -1, 1},
+      {1, -1, 0, 0}, {0, 1, 0, 1}, {1, 1, 0, 2}, {1, -1, 1, 0}, {0, 1, -1, 1}, {1, 1, -1, 2}, {1, -1, -1, -1}, {0, 1, 1, 2}, {1, 1, 1, 3},
+      {1, 0, 0, 0}, {1, 1, 0, 0}, {1, 0, -1, -1}, {1, 1, -1, -1}, {1, 0, 1, 0}, {1, 1, 1, 0}, {1, -1, 0, -1}, {1, -1, 1, -1}, {1, -1, -1, -2}};
 
   template <typename M>
   COctreeSMC<M>::COctreeSMC(M *pMesh, int maxDepth)
   {
     m_pMesh = pMesh;
     m_maxDepth = maxDepth > 0 ? maxDepth : 1;
-    m_root = build_root();
-    for (typename M::MeshFaceIterator mf(m_pMesh); !mf.end(); mf++)
-    {
-      insert_face(m_root, mf.value(), face_centroid(mf.value()));
-    }
+    if (m_maxDepth > 9)
+      m_maxDepth = 9;
+    m_scale = 1 << m_maxDepth;
+    m_root = NULL;
+    build_root_bbox();
+    build_triangles();
   }
 
   template <typename M>
-  typename COctreeSMC<M>::OctreeNode *COctreeSMC<M>::build_root()
+  COctreeSMC<M>::~COctreeSMC()
+  {
+    if (m_root != NULL)
+      delete m_root;
+  }
+
+  template <typename M>
+  void COctreeSMC<M>::build_root_bbox()
   {
     CPoint pmin(1e30, 1e30, 1e30);
     CPoint pmax(-1e30, -1e30, -1e30);
@@ -438,122 +544,56 @@ namespace MeshLib
           pmax[i] = p[i];
       }
     }
-
     CPoint size = pmax - pmin;
     double max_len = size[0];
     if (size[1] > max_len)
       max_len = size[1];
     if (size[2] > max_len)
       max_len = size[2];
-
-    if (max_len <= 0)
+    if (max_len <= 1e-12)
       max_len = 1.0;
-
     CPoint center = (pmin + pmax) / 2.0;
     CPoint half(max_len * 0.5, max_len * 0.5, max_len * 0.5);
-    return new OctreeNode(center - half, center + half, 0);
+    m_rootMin = center - half;
+    m_rootMax = center + half;
+    m_step = max_len / static_cast<double>(m_scale);
   }
 
   template <typename M>
-  void COctreeSMC<M>::build_triangles(vector<Tri> &tris) const
+  void COctreeSMC<M>::build_triangles()
   {
+    m_tris.clear();
     vector<typename M::CVertex *> verts;
     for (typename M::MeshFaceIterator mf(m_pMesh); !mf.end(); mf++)
     {
-      face_vertices(mf.value(), verts);
+      verts.clear();
+      for (typename M::FaceVertexIterator fv(mf.value()); !fv.end(); fv++)
+        verts.push_back(fv.value());
       if (verts.size() < 3)
         continue;
       CPoint p0 = verts[0]->point();
       for (size_t i = 1; i + 1 < verts.size(); ++i)
       {
-        CPoint p1 = verts[i]->point();
-        CPoint p2 = verts[i + 1]->point();
         Tri tri;
         tri.p0 = p0;
-        tri.p1 = p1;
-        tri.p2 = p2;
-        tri.bmin = p0;
-        tri.bmax = p0;
+        tri.p1 = verts[i]->point();
+        tri.p2 = verts[i + 1]->point();
+        tri.bmin = tri.p0;
+        tri.bmax = tri.p0;
         for (int k = 0; k < 3; ++k)
         {
-          if (p1[k] < tri.bmin[k])
-            tri.bmin[k] = p1[k];
-          if (p2[k] < tri.bmin[k])
-            tri.bmin[k] = p2[k];
-          if (p1[k] > tri.bmax[k])
-            tri.bmax[k] = p1[k];
-          if (p2[k] > tri.bmax[k])
-            tri.bmax[k] = p2[k];
+          if (tri.p1[k] < tri.bmin[k])
+            tri.bmin[k] = tri.p1[k];
+          if (tri.p2[k] < tri.bmin[k])
+            tri.bmin[k] = tri.p2[k];
+          if (tri.p1[k] > tri.bmax[k])
+            tri.bmax[k] = tri.p1[k];
+          if (tri.p2[k] > tri.bmax[k])
+            tri.bmax[k] = tri.p2[k];
         }
-        tris.push_back(tri);
+        m_tris.push_back(tri);
       }
     }
-  }
-
-  template <typename M>
-  bool COctreeSMC<M>::tri_box_overlap(const Tri &tri, const CPoint &bmin, const CPoint &bmax) const
-  {
-    for (int k = 0; k < 3; ++k)
-    {
-      if (tri.bmax[k] < bmin[k] || tri.bmin[k] > bmax[k])
-        return false;
-    }
-    return true;
-  }
-
-  template <typename M>
-  void COctreeSMC<M>::build_octree(OctreeNode *node, const vector<int> &tri_ids, int maxDepth, int maxTris)
-  {
-    node->tris = tri_ids;
-    if (node->depth >= maxDepth || static_cast<int>(tri_ids.size()) <= maxTris)
-      return;
-
-    CPoint mid = (node->min + node->max) / 2.0;
-    vector<int> child_tris[8];
-    for (size_t i = 0; i < tri_ids.size(); ++i)
-    {
-      const Tri &tri = m_tris[tri_ids[i]];
-      for (int c = 0; c < 8; ++c)
-      {
-        CPoint cmin = node->min;
-        CPoint cmax = node->max;
-        if (c & 1)
-          cmin[0] = mid[0];
-        else
-          cmax[0] = mid[0];
-        if (c & 2)
-          cmin[1] = mid[1];
-        else
-          cmax[1] = mid[1];
-        if (c & 4)
-          cmin[2] = mid[2];
-        else
-          cmax[2] = mid[2];
-        if (tri_box_overlap(tri, cmin, cmax))
-          child_tris[c].push_back(tri_ids[i]);
-      }
-    }
-
-    for (int c = 0; c < 8; ++c)
-    {
-      CPoint cmin = node->min;
-      CPoint cmax = node->max;
-      if (c & 1)
-        cmin[0] = mid[0];
-      else
-        cmax[0] = mid[0];
-      if (c & 2)
-        cmin[1] = mid[1];
-      else
-        cmax[1] = mid[1];
-      if (c & 4)
-        cmin[2] = mid[2];
-      else
-        cmax[2] = mid[2];
-      node->children[c] = new OctreeNode(cmin, cmax, node->depth + 1);
-      build_octree(node->children[c], child_tris[c], maxDepth, maxTris);
-    }
-    node->tris.clear();
   }
 
   template <typename M>
@@ -569,604 +609,695 @@ namespace MeshLib
     double invDet = 1.0 / det;
     CPoint tvec = orig - tri.p0;
     double u = (tvec * pvec) * invDet;
-    if (u < 0 || u > 1)
+    if (u < 0.0 || u > 1.0)
       return false;
     CPoint qvec = tvec ^ v0v1;
     double v = (dir * qvec) * invDet;
-    if (v < 0 || u + v > 1)
+    if (v < 0.0 || (u + v) > 1.0)
       return false;
     double t = (v0v2 * qvec) * invDet;
     return t > eps;
   }
 
   template <typename M>
-  bool COctreeSMC<M>::point_in_mesh(const CPoint &p, const vector<Tri> &tris) const
+  bool COctreeSMC<M>::point_in_mesh_fast(const CPoint &p) const
   {
-    CPoint dir(1, 0, 0);
+    const CPoint dir(1, 0, 0);
     int hits = 0;
-    for (size_t i = 0; i < tris.size(); ++i)
+    for (size_t t = 0; t < m_tris.size(); ++t)
     {
-      if (ray_intersect_triangle(p, dir, tris[i]))
+      const Tri &tri = m_tris[t];
+      if (p[1] < tri.bmin[1] || p[1] > tri.bmax[1])
+        continue;
+      if (p[2] < tri.bmin[2] || p[2] > tri.bmax[2])
+        continue;
+      if (p[0] > tri.bmax[0])
+        continue;
+      if (ray_intersect_triangle(p, dir, tri))
         hits++;
     }
     return (hits % 2) == 1;
   }
 
   template <typename M>
-  bool COctreeSMC<M>::point_in_mesh_vote(const CPoint &p, const vector<Tri> &tris) const
+  bool COctreeSMC<M>::point_in_mesh_vote(const CPoint &p) const
   {
     const CPoint dirs[3] = {CPoint(1, 0, 0), CPoint(0, 1, 0), CPoint(0, 0, 1)};
-    int inside_count = 0;
+    int insideCount = 0;
     for (int i = 0; i < 3; ++i)
     {
       int hits = 0;
-      for (size_t t = 0; t < tris.size(); ++t)
+      for (size_t t = 0; t < m_tris.size(); ++t)
       {
-        if (ray_intersect_triangle(p, dirs[i], tris[t]))
+        const Tri &tri = m_tris[t];
+        if (i == 0)
+        {
+          if (p[1] < tri.bmin[1] || p[1] > tri.bmax[1] || p[2] < tri.bmin[2] || p[2] > tri.bmax[2] || p[0] > tri.bmax[0])
+            continue;
+        }
+        else if (i == 1)
+        {
+          if (p[0] < tri.bmin[0] || p[0] > tri.bmax[0] || p[2] < tri.bmin[2] || p[2] > tri.bmax[2] || p[1] > tri.bmax[1])
+            continue;
+        }
+        else
+        {
+          if (p[0] < tri.bmin[0] || p[0] > tri.bmax[0] || p[1] < tri.bmin[1] || p[1] > tri.bmax[1] || p[2] > tri.bmax[2])
+            continue;
+        }
+        if (ray_intersect_triangle(p, dirs[i], m_tris[t]))
           hits++;
       }
       if ((hits % 2) == 1)
-        inside_count++;
+        insideCount++;
     }
-    return inside_count >= 2;
+    return insideCount >= 2;
   }
 
   template <typename M>
-  void COctreeSMC<M>::classify_leaves(OctreeNode *node, const vector<Tri> &tris)
+  int COctreeSMC<M>::get_index_on(int x, int y, int z, int bitIndex) const
   {
-    if (node == NULL)
-      return;
-    if (node->is_leaf())
+    int ret = 0;
+    if ((x & (1 << bitIndex)) != 0)
+      ret |= 1;
+    if ((y & (1 << bitIndex)) != 0)
+      ret |= 2;
+    if ((z & (1 << bitIndex)) != 0)
+      ret |= 4;
+    return ret;
+  }
+
+  template <typename M>
+  void COctreeSMC<M>::init_child_range(OctreeNode *node, OctreeNode *parent, int index) const
+  {
+    int dx = (parent->range.xmax - parent->range.xmin + 1) >> 1;
+    int dy = (parent->range.ymax - parent->range.ymin + 1) >> 1;
+    int dz = (parent->range.zmax - parent->range.zmin + 1) >> 1;
+    if ((index & 1) == 0)
     {
-      node->boundary = !node->tris.empty();
-      if (!node->boundary)
+      node->range.xmin = parent->range.xmin;
+      node->range.xmax = parent->range.xmin + dx - 1;
+    }
+    else
+    {
+      node->range.xmin = parent->range.xmin + dx;
+      node->range.xmax = parent->range.xmax;
+    }
+    if ((index & 2) == 0)
+    {
+      node->range.ymin = parent->range.ymin;
+      node->range.ymax = parent->range.ymin + dy - 1;
+    }
+    else
+    {
+      node->range.ymin = parent->range.ymin + dy;
+      node->range.ymax = parent->range.ymax;
+    }
+    if ((index & 4) == 0)
+    {
+      node->range.zmin = parent->range.zmin;
+      node->range.zmax = parent->range.zmin + dz - 1;
+    }
+    else
+    {
+      node->range.zmin = parent->range.zmin + dz;
+      node->range.zmax = parent->range.zmax;
+    }
+  }
+
+  template <typename M>
+  typename COctreeSMC<M>::OctreeNode *COctreeSMC<M>::create_to_leaf(int x, int y, int z)
+  {
+    OctreeNode *node = m_root;
+    for (int i = 1; i <= m_maxDepth; ++i)
+    {
+      int idx = get_index_on(x, y, z, m_maxDepth - i);
+      if (node->children[idx] == NULL)
       {
-        CPoint center = (node->min + node->max) / 2.0;
-        node->inside = point_in_mesh(center, tris);
+        OctreeNode *child = new OctreeNode();
+        child->parent = node;
+        child->indexInParent = idx;
+        child->layerIndex = node->layerIndex - 1;
+        init_child_range(child, node, idx);
+        node->children[idx] = child;
       }
-      return;
+      node = node->children[idx];
     }
+    return node;
+  }
+
+  template <typename M>
+  int COctreeSMC<M>::calculate_d(int cx, int cy, int cz, unsigned char config) const
+  {
+    unsigned char eq = kConfigToEqType[config];
+    if (eq >= 54)
+      return INT_MIN;
+    const OSMCEq4 &e = kEqTypeToEqQuad[eq];
+    return e.d + e.a * cx + e.b * cy + e.c * cz;
+  }
+
+  template <typename M>
+  unsigned char COctreeSMC<M>::calculate_config(OctreeNode *children[8]) const
+  {
+    unsigned char firstc = 0;
+    int firstIndex = -1;
     for (int i = 0; i < 8; ++i)
-      classify_leaves(node->children[i], tris);
-  }
-
-  template <typename M>
-  typename COctreeSMC<M>::OctreeNode *COctreeSMC<M>::find_leaf(OctreeNode *node, const CPoint &p) const
-  {
-    if (node == NULL)
-      return NULL;
-    if (p[0] < node->min[0] || p[0] > node->max[0] ||
-        p[1] < node->min[1] || p[1] > node->max[1] ||
-        p[2] < node->min[2] || p[2] > node->max[2])
-      return NULL;
-    if (node->is_leaf())
-      return node;
-    CPoint mid = (node->min + node->max) / 2.0;
-    int index = 0;
-    if (p[0] >= mid[0])
-      index |= 1;
-    if (p[1] >= mid[1])
-      index |= 2;
-    if (p[2] >= mid[2])
-      index |= 4;
-    return find_leaf(node->children[index], p);
-  }
-
-  template <typename M>
-  void COctreeSMC<M>::insert_face(OctreeNode *node, typename M::CFace *face, const CPoint &centroid)
-  {
-    if (node->depth >= m_maxDepth)
     {
-      node->faces.push_back(face);
-      return;
-    }
-
-    CPoint mid = (node->min + node->max) / 2.0;
-    int index = 0;
-    if (centroid[0] >= mid[0])
-      index |= 1;
-    if (centroid[1] >= mid[1])
-      index |= 2;
-    if (centroid[2] >= mid[2])
-      index |= 4;
-
-    if (node->children[index] == NULL)
-    {
-      CPoint cmin = node->min;
-      CPoint cmax = node->max;
-      if (index & 1)
-        cmin[0] = mid[0];
-      else
-        cmax[0] = mid[0];
-      if (index & 2)
-        cmin[1] = mid[1];
-      else
-        cmax[1] = mid[1];
-      if (index & 4)
-        cmin[2] = mid[2];
-      else
-        cmax[2] = mid[2];
-
-      node->children[index] = new OctreeNode(cmin, cmax, node->depth + 1);
-    }
-
-    insert_face(node->children[index], face, centroid);
-  }
-
-  template <typename M>
-  void COctreeSMC<M>::collect_leaves(OctreeNode *node, vector<OctreeNode *> &leaves)
-  {
-    if (node == NULL)
-      return;
-    if (node->is_leaf())
-    {
-      leaves.push_back(node);
-      return;
-    }
-    for (int i = 0; i < 8; ++i)
-      collect_leaves(node->children[i], leaves);
-  }
-
-  template <typename M>
-  CPoint COctreeSMC<M>::face_centroid(typename M::CFace *face) const
-  {
-    CPoint c(0, 0, 0);
-    int count = 0;
-    for (typename M::FaceVertexIterator fv(face); !fv.end(); fv++)
-    {
-      c += fv.value()->point();
-      ++count;
-    }
-    if (count > 0)
-      c /= static_cast<double>(count);
-    return c;
-  }
-
-  template <typename M>
-  void COctreeSMC<M>::face_vertices(typename M::CFace *face, vector<typename M::CVertex *> &verts) const
-  {
-    verts.clear();
-    for (typename M::FaceVertexIterator fv(face); !fv.end(); fv++)
-    {
-      verts.push_back(fv.value());
-    }
-  }
-
-  template <typename M>
-  bool COctreeSMC<M>::are_coplanar(const vector<typename M::CVertex *> &a, const vector<typename M::CVertex *> &b) const
-  {
-    if (a.size() != 3 || b.size() != 3)
-      return false;
-    CPoint n1 = (a[1]->point() - a[0]->point()) ^ (a[2]->point() - a[0]->point());
-    CPoint n2 = (b[1]->point() - b[0]->point()) ^ (b[2]->point() - b[0]->point());
-    double l1 = n1.norm();
-    double l2 = n2.norm();
-    if (l1 <= 0 || l2 <= 0)
-      return false;
-    n1 /= l1;
-    n2 /= l2;
-    if (fabs(n1 * n2) < 0.999)
-      return false;
-    double d1 = n1 * a[0]->point();
-    double d2 = n1 * b[0]->point();
-    return fabs(d1 - d2) < 1e-6;
-  }
-
-  template <typename M>
-  bool COctreeSMC<M>::build_quad(const vector<typename M::CVertex *> &a, const vector<typename M::CVertex *> &b,
-                                 vector<typename M::CVertex *> &quad) const
-  {
-    if (!are_coplanar(a, b))
-      return false;
-
-    vector<typename M::CVertex *> uniq;
-    uniq.reserve(4);
-    for (size_t i = 0; i < a.size(); ++i)
-    {
-      bool found = false;
-      for (size_t k = 0; k < uniq.size(); ++k)
+      if (children[i] != NULL && children[i]->parms.valid)
       {
-        if (uniq[k] == a[i])
+        firstc = children[i]->parms.config;
+        firstIndex = i;
+        break;
+      }
+    }
+    if (firstIndex < 0)
+      return 0;
+
+    unsigned char midValue = ((firstc & kPointFlagCS[kMidVoxelIndexCS[firstIndex]]) == 0) ? 0 : 255;
+    int ret = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+      unsigned char cfg = midValue;
+      if (children[i] != NULL && children[i]->parms.valid)
+        cfg = children[i]->parms.config;
+      unsigned char flag = kPointFlagCS[kVertexVoxelIndexCS[i]];
+      ret |= (cfg & flag);
+    }
+    return static_cast<unsigned char>(ret);
+  }
+
+  template <typename M>
+  bool COctreeSMC<M>::can_merge_node(OctreeNode *node, int &D) const
+  {
+    unsigned char normalType = kNormalNotSimple;
+    bool found = false;
+    for (int i = 0; i < 8; ++i)
+    {
+      OctreeNode *c = node->children[i];
+      if (c != NULL)
+      {
+        if (!c->parms.valid)
+          return false;
+        unsigned char nt = kConfigToNormalTypeId[c->parms.config];
+        if (nt == kNormalNotSimple)
+          return false;
+        if (!found)
         {
           found = true;
-          break;
-        }
-      }
-      if (!found)
-        uniq.push_back(a[i]);
-    }
-    for (size_t i = 0; i < b.size(); ++i)
-    {
-      bool found = false;
-      for (size_t k = 0; k < uniq.size(); ++k)
-      {
-        if (uniq[k] == b[i])
-        {
-          found = true;
-          break;
-        }
-      }
-      if (!found)
-        uniq.push_back(b[i]);
-    }
-
-    if (uniq.size() != 4)
-      return false;
-
-    CPoint normal = (a[1]->point() - a[0]->point()) ^ (a[2]->point() - a[0]->point());
-    double nlen = normal.norm();
-    if (nlen <= 0)
-      return false;
-    normal /= nlen;
-
-    typename M::CVertex *s0 = NULL;
-    typename M::CVertex *s1 = NULL;
-    for (size_t i = 0; i < a.size(); ++i)
-    {
-      for (size_t j = 0; j < b.size(); ++j)
-      {
-        if (a[i] == b[j])
-        {
-          if (s0 == NULL)
-            s0 = a[i];
-          else if (s1 == NULL && a[i] != s0)
-            s1 = a[i];
+          normalType = nt;
+          D = c->parms.d;
         }
       }
     }
-    if (s0 == NULL || s1 == NULL)
+    if (!found)
       return false;
-
-    typename M::CVertex *o1 = NULL;
-    typename M::CVertex *o2 = NULL;
-    for (size_t i = 0; i < a.size(); ++i)
+    for (int i = 0; i < 8; ++i)
     {
-      if (a[i] != s0 && a[i] != s1)
-        o1 = a[i];
-    }
-    for (size_t i = 0; i < b.size(); ++i)
-    {
-      if (b[i] != s0 && b[i] != s1)
-        o2 = b[i];
-    }
-    if (o1 == NULL || o2 == NULL)
-      return false;
-
-    vector<typename M::CVertex *> cand1;
-    cand1.push_back(o1);
-    cand1.push_back(s0);
-    cand1.push_back(o2);
-    cand1.push_back(s1);
-
-    vector<typename M::CVertex *> cand2;
-    cand2.push_back(o1);
-    cand2.push_back(s1);
-    cand2.push_back(o2);
-    cand2.push_back(s0);
-
-    auto accept_candidate = [&](vector<typename M::CVertex *> &cand) -> bool
-    {
-      if (valid_quad(cand, normal))
+      OctreeNode *c = node->children[i];
+      if (c != NULL)
       {
-        quad = cand;
-        return true;
+        unsigned char nt = kConfigToNormalTypeId[c->parms.config];
+        if (nt != normalType || c->parms.d != D)
+          return false;
       }
-      reverse(cand.begin(), cand.end());
-      if (valid_quad(cand, normal))
+    }
+    return true;
+  }
+
+  template <typename M>
+  CPoint COctreeSMC<M>::grid_to_world(double gx, double gy, double gz) const
+  {
+    return CPoint(m_rootMin[0] + gx * m_step,
+                  m_rootMin[1] + gy * m_step,
+                  m_rootMin[2] + gz * m_step);
+  }
+
+  template <typename M>
+  void COctreeSMC<M>::construct_tree()
+  {
+    long long totalCells = static_cast<long long>(m_scale) * m_scale * m_scale;
+    long long processed = 0;
+    long long boundaryCells = 0;
+    int zLogStep = m_scale / 20;
+    if (zLogStep < 1)
+      zLogStep = 1;
+    long long cellLogStep = totalCells / 200;
+    if (cellLogStep < 1000)
+      cellLogStep = 1000;
+
+    int gp = m_scale + 1;
+    vector<signed char> pointState(static_cast<size_t>(gp) * gp * gp, -1);
+    auto pointIndex = [&](int gx, int gy, int gz) -> size_t
+    {
+      return (static_cast<size_t>(gz) * gp + gy) * gp + gx;
+    };
+    auto pointInsideCached = [&](int gx, int gy, int gz) -> bool
+    {
+      size_t idx = pointIndex(gx, gy, gz);
+      signed char &st = pointState[idx];
+      if (st < 0)
       {
-        quad = cand;
-        return true;
+        CPoint p = grid_to_world(static_cast<double>(gx), static_cast<double>(gy), static_cast<double>(gz));
+        st = point_in_mesh_fast(p) ? 1 : 0;
       }
-      return false;
+      return st > 0;
     };
 
-    if (accept_candidate(cand1))
-      return true;
-    if (accept_candidate(cand2))
-      return true;
+    cout << "[OctreeSMC] ConstructTree start, cells=" << totalCells << endl;
 
-    return false;
+    for (int z = 0; z < m_scale; ++z)
+    {
+      for (int y = 0; y < m_scale; ++y)
+      {
+        for (int x = 0; x < m_scale; ++x)
+        {
+          unsigned char value = 0;
+          for (int pi = 0; pi < 8; ++pi)
+          {
+            int gx = x + kPointDeltaCS[pi][0];
+            int gy = y + kPointDeltaCS[pi][1];
+            int gz = z + kPointDeltaCS[pi][2];
+            if (pointInsideCached(gx, gy, gz))
+              value |= kPointFlagCS[pi];
+          }
+          if (value != 0 && value != 255)
+          {
+            OctreeNode *leaf = create_to_leaf(x, y, z);
+            leaf->parms.valid = true;
+            leaf->parms.config = value;
+            leaf->parms.d = calculate_d(x, y, z, value);
+            boundaryCells++;
+            leaf->visited = true;
+            if (leaf->parent != NULL && !leaf->parent->visited)
+            {
+              leaf->parent->visited = true;
+              m_queue.push(leaf->parent);
+            }
+          }
+          processed++;
+          if ((processed % cellLogStep) == 0)
+          {
+            double pct2 = totalCells > 0 ? (100.0 * processed / totalCells) : 100.0;
+            cout << "[OctreeSMC] ConstructTree fine progress " << pct2 << "% ("
+                 << processed << "/" << totalCells << ")" << endl;
+          }
+        }
+      }
+      if (((z + 1) % zLogStep) == 0 || z + 1 == m_scale)
+      {
+        double pct = totalCells > 0 ? (100.0 * processed / totalCells) : 100.0;
+        cout << "[OctreeSMC] ConstructTree progress " << pct << "% (z=" << (z + 1) << "/" << m_scale
+             << ", boundary=" << boundaryCells << ")" << endl;
+      }
+    }
+    cout << "[OctreeSMC] ConstructTree done, boundary cells=" << boundaryCells << endl;
   }
 
   template <typename M>
-  bool COctreeSMC<M>::valid_triangle(const vector<typename M::CVertex *> &verts) const
+  void COctreeSMC<M>::shrink_tree()
   {
-    if (verts.size() != 3)
-      return false;
-    for (size_t i = 0; i < verts.size(); ++i)
+    long long popped = 0;
+    long long merged = 0;
+    cout << "[OctreeSMC] Shrink start, initial queue=" << m_queue.size() << endl;
+    while (!m_queue.empty())
     {
-      for (size_t j = i + 1; j < verts.size(); ++j)
+      OctreeNode *node = m_queue.front();
+      m_queue.pop();
+      popped++;
+      node->visited = false;
+      int D = INT_MIN;
+      if (can_merge_node(node, D))
       {
-        if (verts[i] == verts[j])
-          return false;
+        node->parms.valid = true;
+        node->parms.config = calculate_config(node->children);
+        node->parms.d = D;
+        node->clear_children();
+        merged++;
+        if (node->parent != NULL && !node->parent->visited)
+        {
+          node->parent->visited = true;
+          m_queue.push(node->parent);
+        }
+      }
+      if ((popped % 5000) == 0)
+      {
+        cout << "[OctreeSMC] Shrink progress popped=" << popped << ", merged=" << merged
+             << ", queue=" << m_queue.size() << endl;
       }
     }
-    CPoint n = (verts[1]->point() - verts[0]->point()) ^ (verts[2]->point() - verts[0]->point());
-    return n.norm() > 1e-8;
+    cout << "[OctreeSMC] Shrink done, popped=" << popped << ", merged=" << merged << endl;
   }
 
   template <typename M>
-  bool COctreeSMC<M>::valid_quad(const vector<typename M::CVertex *> &verts, const CPoint &normal) const
+  CPoint COctreeSMC<M>::get_intersected_point_at_edge(const BoxRange &range, int edgeIndex, const OSMCInt3 &normal, int d) const
   {
-    if (verts.size() != 4)
-      return false;
-    for (size_t i = 0; i < verts.size(); ++i)
+    double x = 0, y = 0, z = 0;
+    switch (edgeIndex)
     {
-      for (size_t j = i + 1; j < verts.size(); ++j)
+    case 0:
+      x = range.xmin;
+      y = range.ymax + 1;
+      z = normal.z != 0 ? static_cast<double>(d - normal.x * x - normal.y * y) / normal.z : range.zmin;
+      break;
+    case 2:
+      x = range.xmin;
+      y = range.ymin;
+      z = normal.z != 0 ? static_cast<double>(d - normal.x * x - normal.y * y) / normal.z : range.zmin;
+      break;
+    case 4:
+      x = range.xmax + 1;
+      y = range.ymax + 1;
+      z = normal.z != 0 ? static_cast<double>(d - normal.x * x - normal.y * y) / normal.z : range.zmin;
+      break;
+    case 6:
+      x = range.xmax + 1;
+      y = range.ymin;
+      z = normal.z != 0 ? static_cast<double>(d - normal.x * x - normal.y * y) / normal.z : range.zmin;
+      break;
+    case 8:
+      y = range.ymax + 1;
+      z = range.zmax + 1;
+      x = normal.x != 0 ? static_cast<double>(d - normal.y * y - normal.z * z) / normal.x : range.xmin;
+      break;
+    case 9:
+      y = range.ymax + 1;
+      z = range.zmin;
+      x = normal.x != 0 ? static_cast<double>(d - normal.y * y - normal.z * z) / normal.x : range.xmin;
+      break;
+    case 10:
+      y = range.ymin;
+      z = range.zmin;
+      x = normal.x != 0 ? static_cast<double>(d - normal.y * y - normal.z * z) / normal.x : range.xmin;
+      break;
+    case 11:
+      y = range.ymin;
+      z = range.zmax + 1;
+      x = normal.x != 0 ? static_cast<double>(d - normal.y * y - normal.z * z) / normal.x : range.xmin;
+      break;
+    case 1:
+      x = range.xmin;
+      z = range.zmin;
+      y = normal.y != 0 ? static_cast<double>(d - normal.x * x - normal.z * z) / normal.y : range.ymin;
+      break;
+    case 3:
+      x = range.xmin;
+      z = range.zmax + 1;
+      y = normal.y != 0 ? static_cast<double>(d - normal.x * x - normal.z * z) / normal.y : range.ymin;
+      break;
+    case 5:
+      x = range.xmax + 1;
+      z = range.zmin;
+      y = normal.y != 0 ? static_cast<double>(d - normal.x * x - normal.z * z) / normal.y : range.ymin;
+      break;
+    default:
+      x = range.xmax + 1;
+      z = range.zmax + 1;
+      y = normal.y != 0 ? static_cast<double>(d - normal.x * x - normal.z * z) / normal.y : range.ymin;
+      break;
+    }
+    return grid_to_world(x, y, z);
+  }
+
+  template <typename M>
+  typename M::CVertex *COctreeSMC<M>::get_vertex(const CPoint &p,
+                                                 M *out,
+                                                 int &vid,
+                                                 map<VertKey, typename M::CVertex *> &vmap,
+                                                 double quant) const
+  {
+    VertKey k;
+    k.x = static_cast<long long>(llround(p[0] * quant));
+    k.y = static_cast<long long>(llround(p[1] * quant));
+    k.z = static_cast<long long>(llround(p[2] * quant));
+    typename M::CVertex *&v = vmap[k];
+    if (v == NULL)
+    {
+      v = out->createVertex(vid++);
+      v->point() = p;
+    }
+    return v;
+  }
+
+  template <typename M>
+  bool COctreeSMC<M>::can_add_face(vector<typename M::CVertex *> &verts,
+                                   map<EdgeKey, int> &edgeUse,
+                                   map<EdgeKey, int> &dirEdgeUse) const
+  {
+    size_t n = verts.size();
+    if (n < 3)
+      return false;
+    for (size_t i = 0; i < n; ++i)
+    {
+      int a = verts[i]->id();
+      int b = verts[(i + 1) % n]->id();
+      if (a == b)
+        return false;
+      EdgeKey und{a < b ? a : b, a < b ? b : a};
+      if (edgeUse[und] >= 2)
+        return false;
+    }
+    bool needFlip = false;
+    for (size_t i = 0; i < n; ++i)
+    {
+      int a = verts[i]->id();
+      int b = verts[(i + 1) % n]->id();
+      EdgeKey dir{a, b};
+      if (dirEdgeUse[dir] > 0)
       {
-        if (verts[i] == verts[j])
-          return false;
+        needFlip = true;
+        break;
       }
     }
+    if (needFlip)
+      reverse(verts.begin() + 1, verts.end());
 
-    CPoint n = normal;
-    double nlen = n.norm();
-    if (nlen <= 0)
-      return false;
-    n /= nlen;
-    double d = n * verts[0]->point();
-    for (size_t i = 1; i < verts.size(); ++i)
+    for (size_t i = 0; i < n; ++i)
     {
-      double dist = fabs(n * verts[i]->point() - d);
-      if (dist > 1e-6)
+      int a = verts[i]->id();
+      int b = verts[(i + 1) % n]->id();
+      EdgeKey dir{a, b};
+      if (dirEdgeUse[dir] > 0)
         return false;
     }
 
-    CPoint n0 = (verts[1]->point() - verts[0]->point()) ^ (verts[2]->point() - verts[0]->point());
-    CPoint n1 = (verts[2]->point() - verts[0]->point()) ^ (verts[3]->point() - verts[0]->point());
-    return n0.norm() > 1e-8 && n1.norm() > 1e-8;
+    for (size_t i = 0; i < n; ++i)
+    {
+      int a = verts[i]->id();
+      int b = verts[(i + 1) % n]->id();
+      EdgeKey und{a < b ? a : b, a < b ? b : a};
+      edgeUse[und] += 1;
+      EdgeKey dir{a, b};
+      dirEdgeUse[dir] += 1;
+    }
+    return true;
   }
 
   template <typename M>
-  typename M::CVertex *COctreeSMC<M>::get_or_create_vertex(M *out, typename M::CVertex *v,
-                                                           map<typename M::CVertex *, typename M::CVertex *> &vmap, int &vid) const
+  void COctreeSMC<M>::generate_face(OctreeNode *node, M *out, int &vid, int &fid,
+                                    map<VertKey, typename M::CVertex *> &vmap,
+                                    map<EdgeKey, int> &edgeUse,
+                                    map<EdgeKey, int> &dirEdgeUse,
+                                    double quant) const
   {
-    typename M::CVertex *&cached = vmap[v];
-    if (cached == NULL)
+    unsigned char cfg = node->parms.config;
+    int nt = kConfigToNormalTypeId[cfg];
+    if (nt >= static_cast<int>(kNormalNotSimple))
     {
-      cached = out->createVertex(vid++);
-      cached->point() = v->point();
+      generate_face_leaf(node, out, vid, fid, vmap, edgeUse, dirEdgeUse, quant);
+      return;
     }
-    return cached;
+    const OSMCInt3 &normal = kNormalTypeIdToNormal[nt];
+
+    CPoint corners[8];
+    for (int k = 0; k < 8; ++k)
+    {
+      double gx = node->range.xmin + kCornerOffset[k][0] * (node->range.xmax - node->range.xmin + 1);
+      double gy = node->range.ymin + kCornerOffset[k][1] * (node->range.ymax - node->range.ymin + 1);
+      double gz = node->range.zmin + kCornerOffset[k][2] * (node->range.zmax - node->range.zmin + 1);
+      corners[k] = grid_to_world(gx, gy, gz);
+    }
+    CPoint edgeMid[12];
+    for (int e = 0; e < 12; ++e)
+    {
+      int a = kEdgeCorners[e][0];
+      int b = kEdgeCorners[e][1];
+      edgeMid[e] = (corners[a] + corners[b]) * 0.5;
+    }
+    CPoint pmin = corners[0];
+    CPoint pmax = corners[6];
+    const double tol = 1e-9;
+    auto valid_point = [&](const CPoint &p) -> bool
+    {
+      if (!(p[0] == p[0] && p[1] == p[1] && p[2] == p[2]))
+        return false;
+      if (p[0] < pmin[0] - tol || p[0] > pmax[0] + tol)
+        return false;
+      if (p[1] < pmin[1] - tol || p[1] > pmax[1] + tol)
+        return false;
+      if (p[2] < pmin[2] - tol || p[2] > pmax[2] + tol)
+        return false;
+      return true;
+    };
+
+    for (int i = 0; kTriTable[cfg][i] != -1; i += 3)
+    {
+      int e0 = kTriTable[cfg][i];
+      int e1 = kTriTable[cfg][i + 1];
+      int e2 = kTriTable[cfg][i + 2];
+      CPoint p0 = get_intersected_point_at_edge(node->range, e0, normal, node->parms.d);
+      CPoint p1 = get_intersected_point_at_edge(node->range, e1, normal, node->parms.d);
+      CPoint p2 = get_intersected_point_at_edge(node->range, e2, normal, node->parms.d);
+
+      if (!valid_point(p0))
+        p0 = edgeMid[e0];
+      if (!valid_point(p1))
+        p1 = edgeMid[e1];
+      if (!valid_point(p2))
+        p2 = edgeMid[e2];
+
+      CPoint n = (p1 - p0) ^ (p2 - p0);
+      if (n.norm() <= 1e-10)
+        continue;
+      vector<typename M::CVertex *> tri;
+      tri.push_back(get_vertex(p0, out, vid, vmap, quant));
+      tri.push_back(get_vertex(p1, out, vid, vmap, quant));
+      tri.push_back(get_vertex(p2, out, vid, vmap, quant));
+      if (can_add_face(tri, edgeUse, dirEdgeUse))
+        out->createFace(tri, fid++);
+    }
+  }
+
+  template <typename M>
+  void COctreeSMC<M>::generate_face_leaf(OctreeNode *node, M *out, int &vid, int &fid,
+                                         map<VertKey, typename M::CVertex *> &vmap,
+                                         map<EdgeKey, int> &edgeUse,
+                                         map<EdgeKey, int> &dirEdgeUse,
+                                         double quant) const
+  {
+    unsigned char cfg = node->parms.config;
+    if (cfg == 0 || cfg == 255)
+      return;
+
+    CPoint corners[8];
+    for (int k = 0; k < 8; ++k)
+    {
+      double gx = node->range.xmin + kCornerOffset[k][0];
+      double gy = node->range.ymin + kCornerOffset[k][1];
+      double gz = node->range.zmin + kCornerOffset[k][2];
+      corners[k] = grid_to_world(gx, gy, gz);
+    }
+    CPoint edgePts[12];
+    for (int e = 0; e < 12; ++e)
+    {
+      int a = kEdgeCorners[e][0];
+      int b = kEdgeCorners[e][1];
+      edgePts[e] = (corners[a] + corners[b]) * 0.5;
+    }
+    CPoint cellCenter = grid_to_world(node->range.xmin + 0.5, node->range.ymin + 0.5, node->range.zmin + 0.5);
+
+    for (int i = 0; kTriTable[cfg][i] != -1; i += 3)
+    {
+      CPoint p0 = edgePts[kTriTable[cfg][i]];
+      CPoint p1 = edgePts[kTriTable[cfg][i + 1]];
+      CPoint p2 = edgePts[kTriTable[cfg][i + 2]];
+      CPoint n = (p1 - p0) ^ (p2 - p0);
+      if (n.norm() <= 1e-10)
+        continue;
+      CPoint triCenter = (p0 + p1 + p2) / 3.0;
+      if ((n * (triCenter - cellCenter)) < 0)
+      {
+        CPoint t = p1;
+        p1 = p2;
+        p2 = t;
+      }
+      vector<typename M::CVertex *> tri;
+      tri.push_back(get_vertex(p0, out, vid, vmap, quant));
+      tri.push_back(get_vertex(p1, out, vid, vmap, quant));
+      tri.push_back(get_vertex(p2, out, vid, vmap, quant));
+      if (can_add_face(tri, edgeUse, dirEdgeUse))
+        out->createFace(tri, fid++);
+    }
   }
 
   template <typename M>
   M *COctreeSMC<M>::quad_mesh()
   {
+    using Clock = std::chrono::steady_clock;
+    auto tStart = Clock::now();
+
     M *out = new M();
     int vid = 1;
     int fid = 1;
 
-    m_tris.clear();
-    build_triangles(m_tris);
-    vector<int> all_ids;
-    all_ids.reserve(m_tris.size());
-    for (size_t i = 0; i < m_tris.size(); ++i)
-      all_ids.push_back(static_cast<int>(i));
+    if (m_root != NULL)
+      delete m_root;
+    m_root = new OctreeNode();
+    m_root->range.xmin = 0;
+    m_root->range.ymin = 0;
+    m_root->range.zmin = 0;
+    m_root->range.xmax = m_scale - 1;
+    m_root->range.ymax = m_scale - 1;
+    m_root->range.zmax = m_scale - 1;
+    m_root->layerIndex = m_maxDepth;
 
-    const int maxTrisPerNode = 80;
-    build_octree(m_root, all_ids, m_maxDepth, maxTrisPerNode);
-    classify_leaves(m_root, m_tris);
+    while (!m_queue.empty())
+      m_queue.pop();
 
-    const double base = (m_root->max[0] - m_root->min[0]) / static_cast<double>(1 << m_maxDepth);
-    const double eps = base * 0.25;
-    const double corner_offset = 0.1;
+    auto t0 = Clock::now();
+    construct_tree();
+    auto t1 = Clock::now();
+    shrink_tree();
+    auto t2 = Clock::now();
 
     map<VertKey, typename M::CVertex *> vmap;
-    map<EdgeKey, int> edge_use;
-    map<EdgeKey, int> dir_edge_use;
-    auto to_index = [&](double v, int axis) -> int
-    {
-      double t = (v - m_root->min[axis]) / base;
-      return static_cast<int>(floor(t + 0.5));
-    };
-    auto make_key = [&](const CPoint &p) -> VertKey
-    {
-      return {to_index(p[0], 0), to_index(p[1], 1), to_index(p[2], 2)};
-    };
-    auto get_vertex = [&](const CPoint &p) -> typename M::CVertex *
-    {
-      VertKey key = make_key(p);
-      typename M::CVertex *&v = vmap[key];
-      if (v == NULL)
-      {
-        v = out->createVertex(vid++);
-        v->point() = p;
-      }
-      return v;
-    };
-    auto can_add_face = [&](vector<typename M::CVertex *> &verts) -> bool
-    {
-      size_t n = verts.size();
-      for (size_t i = 0; i < n; ++i)
-      {
-        int a = verts[i]->id();
-        int b = verts[(i + 1) % n]->id();
-        if (a == b)
-          return false;
-        EdgeKey key;
-        key.a = a < b ? a : b;
-        key.b = a < b ? b : a;
-        if (edge_use[key] >= 2)
-          return false;
-      }
-      bool need_flip = false;
-      for (size_t i = 0; i < n; ++i)
-      {
-        int a = verts[i]->id();
-        int b = verts[(i + 1) % n]->id();
-        EdgeKey dkey{a, b};
-        if (dir_edge_use[dkey] > 0)
-        {
-          need_flip = true;
-          break;
-        }
-      }
-      if (need_flip)
-      {
-        reverse(verts.begin() + 1, verts.end());
-      }
-      for (size_t i = 0; i < n; ++i)
-      {
-        int a = verts[i]->id();
-        int b = verts[(i + 1) % n]->id();
-        EdgeKey dkey{a, b};
-        if (dir_edge_use[dkey] > 0)
-          return false;
-      }
-      for (size_t i = 0; i < n; ++i)
-      {
-        int a = verts[i]->id();
-        int b = verts[(i + 1) % n]->id();
-        EdgeKey key;
-        key.a = a < b ? a : b;
-        key.b = a < b ? b : a;
-        edge_use[key] += 1;
-        EdgeKey dkey{a, b};
-        dir_edge_use[dkey] += 1;
-      }
-      return true;
-    };
+    map<EdgeKey, int> edgeUse;
+    map<EdgeKey, int> dirEdgeUse;
+    double quant = 1e8;
 
-    vector<OctreeNode *> leaves;
-    collect_leaves(m_root, leaves);
-    auto add_quad_face = [&](const CPoint &p0, const CPoint &p1, const CPoint &p2, const CPoint &p3)
+    queue<OctreeNode *> bfs;
+    bfs.push(m_root);
+    long long visitedNodes = 0;
+    long long visitedLeaves = 0;
+    cout << "[OctreeSMC] Extract start" << endl;
+    while (!bfs.empty())
     {
-      vector<typename M::CVertex *> quad;
-      quad.push_back(get_vertex(p0));
-      quad.push_back(get_vertex(p1));
-      quad.push_back(get_vertex(p2));
-      quad.push_back(get_vertex(p3));
-      if (can_add_face(quad))
-        out->createFace(quad, fid++);
-    };
-    auto add_tri_face = [&](const CPoint &p0, const CPoint &p1, const CPoint &p2)
-    {
-      vector<typename M::CVertex *> tri;
-      tri.push_back(get_vertex(p0));
-      tri.push_back(get_vertex(p1));
-      tri.push_back(get_vertex(p2));
-      if (can_add_face(tri))
-        out->createFace(tri, fid++);
-    };
-    auto mc_cut_triangles = [&](int cfg, const CPoint corners[8], const CPoint &cmin, const CPoint &cmax, bool centerInside)
-    {
-      if (cfg == 0 || cfg == 255)
-        return;
-      CPoint edgePts[12];
-      for (int e = 0; e < 12; ++e)
+      OctreeNode *node = bfs.front();
+      bfs.pop();
+      visitedNodes++;
+      if (node->is_leaf())
       {
-        int a = kEdgeCorners[e][0];
-        int b = kEdgeCorners[e][1];
-        CPoint pa = corners[a];
-        CPoint pb = corners[b];
-        edgePts[e] = (pa + pb) * 0.5;
-      }
-      CPoint cellCenter = (cmin + cmax) / 2.0;
-      for (int i = 0; kTriTable[cfg][i] != -1; i += 3)
-      {
-        int e0 = kTriTable[cfg][i];
-        int e1 = kTriTable[cfg][i + 1];
-        int e2 = kTriTable[cfg][i + 2];
-        CPoint p0 = edgePts[e0];
-        CPoint p1 = edgePts[e1];
-        CPoint p2 = edgePts[e2];
-        CPoint n = (p1 - p0) ^ (p2 - p0);
-        if (n.norm() <= 1e-8)
+        visitedLeaves++;
+        if (!node->parms.valid)
           continue;
-        CPoint triCenter = (p0 + p1 + p2) / 3.0;
-        double dir = n * (triCenter - cellCenter);
-        if ((centerInside && dir < 0) || (!centerInside && dir > 0))
-        {
-          CPoint tmp = p1;
-          p1 = p2;
-          p2 = tmp;
-        }
-        add_tri_face(p0, p1, p2);
-      }
-    };
-
-    map<OctreeNode *, int> cfg_map;
-    for (size_t i = 0; i < leaves.size(); ++i)
-    {
-      OctreeNode *leaf = leaves[i];
-      CPoint cmin = leaf->min;
-      CPoint cmax = leaf->max;
-      CPoint center = (cmin + cmax) / 2.0;
-      int cfg = 0;
-      for (int k = 0; k < 8; ++k)
-      {
-        CPoint corner(
-            kCornerOffset[k][0] ? cmax[0] : cmin[0],
-            kCornerOffset[k][1] ? cmax[1] : cmin[1],
-            kCornerOffset[k][2] ? cmax[2] : cmin[2]);
-        CPoint sample = corner + (center - corner) * corner_offset;
-        if (point_in_mesh(sample, m_tris))
-          cfg |= (1 << k);
-      }
-      cfg_map[leaf] = cfg;
-    }
-
-    for (size_t i = 0; i < leaves.size(); ++i)
-    {
-      OctreeNode *leaf = leaves[i];
-      CPoint cmin = leaf->min;
-      CPoint cmax = leaf->max;
-      CPoint center = (cmin + cmax) / 2.0;
-      int cfg = cfg_map[leaf];
-      if (cfg == 0)
-        continue;
-
-      CPoint corners[8];
-      for (int k = 0; k < 8; ++k)
-      {
-        corners[k] = CPoint(
-            kCornerOffset[k][0] ? cmax[0] : cmin[0],
-            kCornerOffset[k][1] ? cmax[1] : cmin[1],
-            kCornerOffset[k][2] ? cmax[2] : cmin[2]);
-      }
-
-      if (cfg == 255)
-      {
-        CPoint p;
-        OctreeNode *nb;
-
-        p = CPoint(cmin[0] - eps, center[1], center[2]);
-        nb = find_leaf(m_root, p);
-        if (nb == NULL || cfg_map[nb] != 255)
-          add_quad_face(corners[0], corners[4], corners[7], corners[3]);
-
-        p = CPoint(cmax[0] + eps, center[1], center[2]);
-        nb = find_leaf(m_root, p);
-        if (nb == NULL || cfg_map[nb] != 255)
-          add_quad_face(corners[1], corners[2], corners[6], corners[5]);
-
-        p = CPoint(center[0], cmin[1] - eps, center[2]);
-        nb = find_leaf(m_root, p);
-        if (nb == NULL || cfg_map[nb] != 255)
-          add_quad_face(corners[0], corners[1], corners[5], corners[4]);
-
-        p = CPoint(center[0], cmax[1] + eps, center[2]);
-        nb = find_leaf(m_root, p);
-        if (nb == NULL || cfg_map[nb] != 255)
-          add_quad_face(corners[3], corners[7], corners[6], corners[2]);
-
-        p = CPoint(center[0], center[1], cmin[2] - eps);
-        nb = find_leaf(m_root, p);
-        if (nb == NULL || cfg_map[nb] != 255)
-          add_quad_face(corners[0], corners[3], corners[2], corners[1]);
-
-        p = CPoint(center[0], center[1], cmax[2] + eps);
-        nb = find_leaf(m_root, p);
-        if (nb == NULL || cfg_map[nb] != 255)
-          add_quad_face(corners[4], corners[5], corners[6], corners[7]);
+        if (node->range.is_single())
+          generate_face_leaf(node, out, vid, fid, vmap, edgeUse, dirEdgeUse, quant);
+        else
+          generate_face(node, out, vid, fid, vmap, edgeUse, dirEdgeUse, quant);
       }
       else
       {
-        bool centerInside = point_in_mesh_vote(center, m_tris);
-        mc_cut_triangles(cfg, corners, cmin, cmax, centerInside);
+        for (int i = 0; i < 8; ++i)
+          if (node->children[i] != NULL)
+            bfs.push(node->children[i]);
+      }
+      if ((visitedNodes % 20000) == 0)
+      {
+        cout << "[OctreeSMC] Extract progress nodes=" << visitedNodes << ", leaves=" << visitedLeaves
+             << ", faces=" << (fid - 1) << endl;
       }
     }
+    auto t3 = Clock::now();
+
+    auto msConstruct = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    auto msShrink = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+    auto msExtract = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+    auto msTotal = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - tStart).count();
+    cout << "[OctreeSMC] Extract done, nodes=" << visitedNodes << ", leaves=" << visitedLeaves
+         << ", faces=" << (fid - 1) << ", verts=" << (vid - 1) << endl;
+    cout << "[OctreeSMC] Timing(ms): construct=" << msConstruct
+         << ", shrink=" << msShrink
+         << ", extract=" << msExtract
+         << ", total=" << msTotal << endl;
 
     return out;
   }
